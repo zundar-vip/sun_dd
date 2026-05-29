@@ -1,7 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
-const TOKEN = '8150531475:AAG6W7AENatVOtWB9Qc704ewvRbnukvQLEk';
+const TOKEN = '8150531475:AAHqDl79_yG0t56A4f78Bs_LTu1ReOHoOpo';
 const API_URL = 'https://sunwin-ke-u8wn.onrender.com/sun';
 const ADMIN_ID = 7125723417;
 
