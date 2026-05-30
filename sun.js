@@ -1,317 +1,148 @@
 const express = require('express');
 const axios = require('axios');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 const API_URL = 'https://sunwin-ke-u8wn.onrender.com/sun';
-const CHECK_INTERVAL_MS = 3000;
 
-let cachedSessions = [];
-let lastPrediction = null;
-let lastUpdateTime = null;
-let previousLastSessionId = null;
+let sessions = [];
+let prediction = 'Đang tải...';
+let winRate = 0;
+let lastId = '';
 
-function deepFindSessions(obj, found = []) {
-    if (!obj || typeof obj !== 'object') return found;
-    
+function extractAll(obj, out = []) {
+    if (!obj || typeof obj !== 'object') return out;
     if (Array.isArray(obj)) {
-        for (const item of obj) {
-            if (typeof item === 'object' && item !== null) {
-                const hasDice1 = item.dice1 !== undefined;
-                const hasXucXac = item.xuc_xac !== undefined;
-                const hasDices = item.dices !== undefined;
-                const hasTotal = item.total !== undefined;
-                
-                if (hasDice1 || hasXucXac || hasDices || hasTotal) {
-                    found.push(item);
-                } else {
-                    deepFindSessions(item, found);
-                }
-            }
-        }
-    } else if (typeof obj === 'object') {
-        for (const val of Object.values(obj)) {
-            deepFindSessions(val, found);
-        }
+        obj.forEach(v => extractAll(v, out));
+        return out;
     }
-    return found;
+    if (obj.dice1 !== undefined || obj.xuc_xac !== undefined || obj.dices !== undefined || obj.total !== undefined) {
+        out.push(obj);
+    }
+    Object.values(obj).forEach(v => extractAll(v, out));
+    return out;
 }
 
-function parseSession(s, index) {
+function parseOne(raw, idx) {
     let d1, d2, d3;
-
-    if (s.dice1 !== undefined && s.dice2 !== undefined && s.dice3 !== undefined) {
-        d1 = parseInt(s.dice1);
-        d2 = parseInt(s.dice2);
-        d3 = parseInt(s.dice3);
-    } else if (s.xuc_xac && Array.isArray(s.xuc_xac) && s.xuc_xac.length >= 3) {
-        d1 = parseInt(s.xuc_xac[0]);
-        d2 = parseInt(s.xuc_xac[1]);
-        d3 = parseInt(s.xuc_xac[2]);
-    } else if (s.dices && Array.isArray(s.dices) && s.dices.length >= 3) {
-        d1 = parseInt(s.dices[0]);
-        d2 = parseInt(s.dices[1]);
-        d3 = parseInt(s.dices[2]);
-    } else if (s.dice && Array.isArray(s.dice) && s.dice.length >= 3) {
-        d1 = parseInt(s.dice[0]);
-        d2 = parseInt(s.dice[1]);
-        d3 = parseInt(s.dice[2]);
+    if (raw.dice1 !== undefined && raw.dice2 !== undefined && raw.dice3 !== undefined) {
+        d1 = parseInt(raw.dice1); d2 = parseInt(raw.dice2); d3 = parseInt(raw.dice3);
+    } else if (raw.xuc_xac && Array.isArray(raw.xuc_xac) && raw.xuc_xac.length >= 3) {
+        d1 = parseInt(raw.xuc_xac[0]); d2 = parseInt(raw.xuc_xac[1]); d3 = parseInt(raw.xuc_xac[2]);
+    } else if (raw.dices && Array.isArray(raw.dices) && raw.dices.length >= 3) {
+        d1 = parseInt(raw.dices[0]); d2 = parseInt(raw.dices[1]); d3 = parseInt(raw.dices[2]);
+    } else if (raw.dice && Array.isArray(raw.dice) && raw.dice.length >= 3) {
+        d1 = parseInt(raw.dice[0]); d2 = parseInt(raw.dice[1]); d3 = parseInt(raw.dice[2]);
     } else {
         return null;
     }
-
-    if (isNaN(d1) || isNaN(d2) || isNaN(d3)) return null;
-    if (d1 < 1 || d1 > 6 || d2 < 1 || d2 > 6 || d3 < 1 || d3 > 6) return null;
-
+    if ([d1,d2,d3].some(v => isNaN(v) || v < 1 || v > 6)) return null;
     const total = d1 + d2 + d3;
-    const result = total <= 10 ? 'Xỉu' : 'Tài';
-
-    let id = s.phanloai || s.phan_loai || s.session || s.id || s.ma_phien || s.round || s.period || ('p' + index);
-    id = String(id).trim();
-
+    const result = total >= 3 && total <= 10 ? 'Xỉu' : 'Tài';
+    let id = raw.phanloai || raw.phan_loai || raw.session || raw.id || raw.ma_phien || raw.round || raw.period || ('P' + idx);
+    id = String(id).replace(/\s/g, '');
     return { id, d1, d2, d3, total, result };
 }
 
-async function fetchSessions() {
-    try {
-        const res = await axios.get(API_URL, {
-            timeout: 15000,
-            headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-        });
+function dedupe(arr) {
+    const seen = new Set();
+    return arr.filter(s => { if (!s || seen.has(s.id)) return false; seen.add(s.id); return true; });
+}
 
-        const rawSessions = deepFindSessions(res.data, []);
-        const parsed = rawSessions
-            .map((s, i) => parseSession(s, i))
-            .filter(s => s !== null);
-
-        const seen = new Set();
-        const unique = [];
-        for (const s of parsed) {
-            if (!seen.has(s.id)) {
-                seen.add(s.id);
-                unique.push(s);
-            }
-        }
-
-        unique.sort((a, b) => {
-            const aNum = parseInt(a.id.replace(/\D/g, '') || '0');
-            const bNum = parseInt(b.id.replace(/\D/g, '') || '0');
-            return aNum - bNum;
-        });
-
-        return unique.slice(-15);
-    } catch (err) {
-        console.error('Fetch error:', err.message);
-        return cachedSessions.length > 0 ? cachedSessions : [];
-    }
+function sortById(arr) {
+    return arr.sort((a, b) => { const na = parseInt(a.id.replace(/\D/g,''))||0; const nb = parseInt(b.id.replace(/\D/g,''))||0; return na - nb; });
 }
 
 function predict(sessions) {
-    if (sessions.length < 5) {
-        return { prediction: 'Chờ thêm dữ liệu...', winRate: 50, confidence: 'Thấp' };
-    }
-
+    if (sessions.length < 5) return { prediction: 'Tài', winRate: 55 };
     const results = sessions.map(s => s.result);
     const totals = sessions.map(s => s.total);
-    const lastResult = results[results.length - 1];
+    const lastRes = results[results.length - 1];
     const lastTotal = totals[totals.length - 1];
-
     let streak = 0;
-    for (let i = results.length - 1; i >= 0; i--) {
-        if (results[i] === lastResult) streak++;
-        else break;
-    }
-
-    let switchCount = 0;
-    for (let i = results.length - 1; i >= 1; i--) {
-        if (results[i] !== results[i - 1]) switchCount++;
-        else break;
-    }
-
-    const last10 = results.slice(-10);
-    const taiCount = last10.filter(r => r === 'Tài').length;
-    const xiuCount = last10.filter(r => r === 'Xỉu').length;
-
-    let scoreTai = 50;
-    let scoreXiu = 50;
-
-    if (streak >= 6) {
-        if (lastResult === 'Tài') scoreXiu += 30;
-        else scoreTai += 30;
-    } else if (streak >= 5) {
-        if (lastResult === 'Tài') scoreXiu += 25;
-        else scoreTai += 25;
-    } else if (streak >= 4) {
-        if (lastResult === 'Tài') scoreXiu += 20;
-        else scoreTai += 20;
-    } else if (streak >= 3) {
-        if (lastResult === 'Tài') scoreXiu += 14;
-        else scoreTai += 14;
-    } else if (streak >= 2) {
-        if (lastResult === 'Tài') scoreXiu += 8;
-        else scoreTai += 8;
-    }
-
-    if (switchCount >= 5) {
-        if (lastResult === 'Tài') scoreXiu += 18;
-        else scoreTai += 18;
-    } else if (switchCount >= 4) {
-        if (lastResult === 'Tài') scoreXiu += 14;
-        else scoreTai += 14;
-    } else if (switchCount >= 3) {
-        if (lastResult === 'Tài') scoreXiu += 10;
-        else scoreTai += 10;
-    }
-
-    if (taiCount > xiuCount + 3) scoreXiu += 18;
-    else if (xiuCount > taiCount + 3) scoreTai += 18;
-    else if (taiCount > xiuCount + 1) scoreXiu += 10;
-    else if (xiuCount > taiCount + 1) scoreTai += 10;
-
-    if (lastTotal >= 15) scoreXiu += 10;
-    else if (lastTotal >= 13) scoreXiu += 5;
-    else if (lastTotal <= 5) scoreTai += 10;
-    else if (lastTotal <= 7) scoreTai += 5;
-
-    const avgTotal = totals.reduce((a, b) => a + b, 0) / totals.length;
-    if (lastTotal > avgTotal + 3) scoreXiu += 8;
-    else if (lastTotal < avgTotal - 3) scoreTai += 8;
-
-    const prediction = scoreTai >= scoreXiu ? 'Tài' : 'Xỉu';
-    const maxScore = Math.max(scoreTai, scoreXiu);
-    const totalScore = scoreTai + scoreXiu;
-    const winRate = Math.round((maxScore / totalScore) * 100);
-
-    let confidence = 'Thấp';
-    const margin = Math.abs(scoreTai - scoreXiu);
-    if (margin > 30) confidence = 'Rất cao';
-    else if (margin > 20) confidence = 'Cao';
-    else if (margin > 10) confidence = 'Khá';
-    else if (margin > 5) confidence = 'Trung bình';
-
-    return {
-        prediction,
-        winRate: Math.max(53, Math.min(winRate, 98)),
-        confidence,
-        streak,
-        switchCount
-    };
+    for (let i = results.length - 1; i >= 0; i--) { if (results[i] === lastRes) streak++; else break; }
+    let alt = 0;
+    for (let i = results.length - 1; i >= 1; i--) { if (results[i] !== results[i-1]) alt++; else break; }
+    const r10 = results.slice(-10);
+    const tai10 = r10.filter(r => r === 'Tài').length;
+    const xiu10 = r10.filter(r => r === 'Xỉu').length;
+    let sTai = 0, sXiu = 0;
+    if (streak === 2) { lastRes === 'Tài' ? sXiu += 8 : sTai += 8; }
+    else if (streak === 3) { lastRes === 'Tài' ? sXiu += 16 : sTai += 16; }
+    else if (streak === 4) { lastRes === 'Tài' ? sXiu += 24 : sTai += 24; }
+    else if (streak >= 5) { lastRes === 'Tài' ? sXiu += 32 : sTai += 32; }
+    if (alt === 3) { lastRes === 'Tài' ? sXiu += 10 : sTai += 10; }
+    else if (alt === 4) { lastRes === 'Tài' ? sXiu += 16 : sTai += 16; }
+    else if (alt >= 5) { lastRes === 'Tài' ? sXiu += 22 : sTai += 22; }
+    if (tai10 > xiu10 + 3) sXiu += 18;
+    else if (xiu10 > tai10 + 3) sTai += 18;
+    else if (tai10 > xiu10 + 1) sXiu += 10;
+    else if (xiu10 > tai10 + 1) sTai += 10;
+    if (lastTotal >= 15) sXiu += 12;
+    else if (lastTotal >= 13) sXiu += 6;
+    else if (lastTotal <= 5) sTai += 12;
+    else if (lastTotal <= 7) sTai += 6;
+    const avgTotal = totals.reduce((a,b)=>a+b,0)/totals.length;
+    if (lastTotal > avgTotal + 3) sXiu += 8;
+    else if (lastTotal < avgTotal - 3) sTai += 8;
+    const result = sTai >= sXiu ? 'Tài' : 'Xỉu';
+    const max = Math.max(sTai, sXiu);
+    const total = sTai + sXiu;
+    const rate = total > 0 ? Math.round((max / total) * 100) : 55;
+    return { prediction: result, winRate: Math.max(54, Math.min(rate, 98)) };
 }
 
-function getNextSessionId(sessions) {
-    if (sessions.length === 0) return '1';
-    const lastId = sessions[sessions.length - 1].id;
-    const num = parseInt(lastId.replace(/\D/g, '') || '0');
-    return String(num + 1);
+function getNextId() {
+    if (sessions.length === 0) return '???';
+    const last = sessions[sessions.length - 1];
+    return String((parseInt(last.id.replace(/\D/g,'')) || 0) + 1);
 }
 
-function formatOutput(sessions, prediction) {
+function formatOutput() {
     const last10 = sessions.slice(-10);
-    const nextId = getNextSessionId(sessions);
-
     let out = '                  ↓\n';
-    for (let i = 0; i < last10.length; i++) {
-        const s = last10[i];
+    last10.forEach(s => {
         out += ` Phiên: ${s.id}\n`;
         out += ` Xúc xắc: ${s.d1} , ${s.d2} , ${s.d3}\n`;
         out += ` Tổng điểm: ${s.total}\n`;
         out += ` Kết quả: ${s.result}\n`;
         out += `------------------------------\n`;
-    }
-
-    out += `   #PHIÊN: ${nextId}\n`;
-    out += `   Dự Đoán: ${prediction.prediction}\n`;
-    out += `   Tỷ lệ win : ${prediction.winRate}%\n`;
+    });
+    out += `   #PHIÊN: ${getNextId()}\n`;
+    out += `   Dự Đoán: ${prediction}\n`;
+    out += `   Tỷ lệ win : ${winRate}%\n`;
     out += `   admin : zundar`;
-
     return out;
 }
 
-async function updatePrediction() {
-    const sessions = await fetchSessions();
-    
-    if (sessions.length === 0) return;
-
-    const currentLastId = sessions[sessions.length - 1].id;
-    const isNewSession = currentLastId !== previousLastSessionId;
-
-    cachedSessions = sessions;
-
-    if (isNewSession || !lastPrediction) {
-        lastPrediction = predict(sessions);
-        lastUpdateTime = new Date().toLocaleString('vi-VN');
-        previousLastSessionId = currentLastId;
-        console.log(`[${lastUpdateTime}] New prediction: ${lastPrediction.prediction} (${lastPrediction.winRate}%)`);
-    }
-}
-
-function startAutoUpdate() {
-    updatePrediction();
-    setInterval(updatePrediction, CHECK_INTERVAL_MS);
+async function update() {
+    try {
+        const res = await axios.get(API_URL, { timeout: 15000 });
+        const raw = extractAll(res.data, []);
+        const parsed = raw.map((r,i) => parseOne(r,i)).filter(s => s !== null);
+        const unique = dedupe(parsed);
+        const sorted = sortById(unique);
+        const valid = sorted.filter(s => s.result === 'Tài' || s.result === 'Xỉu');
+        if (valid.length > 0) {
+            const latest = valid[valid.length - 1];
+            if (latest.id !== lastId) {
+                sessions = valid.slice(-20);
+                const pred = predict(sessions);
+                prediction = pred.prediction;
+                winRate = pred.winRate;
+                lastId = latest.id;
+            }
+        }
+    } catch (e) {}
 }
 
 app.get('/', async (req, res) => {
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-
-    if (!lastPrediction || cachedSessions.length === 0) {
-        await updatePrediction();
-    }
-
-    if (!lastPrediction || cachedSessions.length === 0) {
-        res.send('Đang tải dữ liệu... Refresh sau 3 giây.');
-        return;
-    }
-
-    const output = formatOutput(cachedSessions, lastPrediction);
-    const htmlOutput = `<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="3">
-    <title>Sunwin Analyzer</title>
-    <style>
-        body { background: #000; color: #0f0; font-family: monospace; font-size: 16px; padding: 20px; white-space: pre; }
-    </style>
-</head>
-<body>${output.replace(/\n/g, '<br>')}<br><br>Cập nhật lúc: ${lastUpdateTime}</body>
-</html>`;
-
-    res.send(htmlOutput);
+    if (sessions.length < 5) await update();
+    res.send(formatOutput());
 });
 
-app.get('/raw', (req, res) => {
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    if (!lastPrediction || cachedSessions.length === 0) {
-        res.send('Chưa có dữ liệu.');
-        return;
-    }
-    res.send(formatOutput(cachedSessions, lastPrediction));
-});
-
-app.get('/json', (req, res) => {
-    res.json({
-        sessions: cachedSessions.slice(-10),
-        prediction: lastPrediction,
-        nextSession: getNextSessionId(cachedSessions),
-        lastUpdate: lastUpdateTime,
-        admin: 'zundar'
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.json({ 
-        ok: true, 
-        sessionsCached: cachedSessions.length,
-        hasPrediction: lastPrediction !== null,
-        lastUpdate: lastUpdateTime
-    });
-});
-
-app.listen(PORT, () => {
-    console.log(`Tai Xiu Auto Predict running on port ${PORT}`);
-    startAutoUpdate();
+app.listen(PORT, async () => {
+    console.log(`Running on port ${PORT}`);
+    await update();
+    setInterval(update, 2500);
 });
