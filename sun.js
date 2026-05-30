@@ -1,224 +1,250 @@
-const TelegramBot = require('node-telegram-bot-api');
+const express = require('express');
 const axios = require('axios');
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-const TOKEN = '8150531475:AAHqDl79_yG0t56A4f78Bs_LTu1ReOHoOpo';
-const API_URL = 'https://sunwin-ke-u8wn.onrender.com/sun';
-const ADMIN_ID = 7125723417;
+let sessionHistory = [];
+let predictionCache = {};
 
-const bot = new TelegramBot(TOKEN, { polling: true });
-
-let chatIds = new Set();
-let lastSessionId = null;
-let isRunning = false;
-
-class AdvancedTXAnalyzer {
+class SunwinAnalyzer {
     constructor() {
-        this.weightMatrix = {
-            cau_bet: 0.35,
-            cau_lap: 0.25,
-            cau_dao: 0.20,
-            cau_nhay: 0.15,
-            random_factor: 0.05
+        this.api = 'https://sunwin-ke-u8wn.onrender.com/sun';
+        this.markovMatrix = {};
+        this.patternWindow = 10;
+    }
+
+    async fetchLatestSession() {
+        try {
+            const res = await axios.get(this.api, { timeout: 10000 });
+            return res.data;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    extractDiceValues(session) {
+        const dices = [];
+        if (session.dice1) dices.push(session.dice1);
+        if (session.dice2) dices.push(session.dice2);
+        if (session.dice3) dices.push(session.dice3);
+        if (session.xuc_xac && Array.isArray(session.xuc_xac)) return session.xuc_xac;
+        if (session.dices && Array.isArray(session.dices)) return session.dices;
+        return dices.length === 3 ? dices : [];
+    }
+
+    determineResult(total) {
+        if (total >= 3 && total <= 10) return 'Xỉu';
+        if (total >= 11 && total <= 18) return 'Tài';
+        return 'Unknown';
+    }
+
+    updateMarkovChain(history) {
+        if (history.length < 2) return;
+        const lastResult = history[history.length - 1].result;
+        const prevResult = history[history.length - 2].result;
+        if (!this.markovMatrix[prevResult]) this.markovMatrix[prevResult] = {};
+        if (!this.markovMatrix[prevResult][lastResult]) this.markovMatrix[prevResult][lastResult] = 0;
+        this.markovMatrix[prevResult][lastResult]++;
+    }
+
+    calculateTransitionProbability(currentResult) {
+        if (!this.markovMatrix[currentResult]) return { Tai: 0.5, Xiu: 0.5 };
+        const transitions = this.markovMatrix[currentResult];
+        const total = Object.values(transitions).reduce((a, b) => a + b, 0);
+        if (total === 0) return { Tai: 0.5, Xiu: 0.5 };
+        const probs = {};
+        for (const [key, val] of Object.entries(transitions)) {
+            probs[key] = val / total;
+        }
+        if (!probs['Tài']) probs['Tài'] = 0;
+        if (!probs['Xỉu']) probs['Xỉu'] = 0;
+        return probs;
+    }
+
+    analyzePattern(history) {
+        if (history.length < 3) return { Tai: 0.5, Xiu: 0.5 };
+        let streakCount = 0;
+        const lastResult = history[history.length - 1].result;
+        for (let i = history.length - 1; i >= 0; i--) {
+            if (history[i].result === lastResult) streakCount++;
+            else break;
+        }
+        let patternProb = {};
+        if (streakCount >= 4) {
+            patternProb[lastResult] = 0.25;
+            patternProb[lastResult === 'Tài' ? 'Xỉu' : 'Tài'] = 0.75;
+        } else if (streakCount >= 3) {
+            patternProb[lastResult] = 0.35;
+            patternProb[lastResult === 'Tài' ? 'Xỉu' : 'Tài'] = 0.65;
+        } else if (streakCount >= 2) {
+            patternProb[lastResult] = 0.45;
+            patternProb[lastResult === 'Tài' ? 'Xỉu' : 'Tài'] = 0.55;
+        } else {
+            patternProb['Tài'] = 0.5;
+            patternProb['Xỉu'] = 0.5;
+        }
+        return patternProb;
+    }
+
+    bayesianUpdate(prior, likelihood, totalProb) {
+        return (likelihood * prior) / (totalProb > 0 ? totalProb : 1);
+    }
+
+    predictNextSession(history) {
+        if (history.length < 2) {
+            return { prediction: 'Tài', winRate: 50 };
+        }
+
+        const lastSession = history[history.length - 1];
+        const currentResult = lastSession.result;
+
+        const markovProbs = this.calculateTransitionProbability(currentResult);
+        const patternProbs = this.analyzePattern(history);
+
+        let totalTai = (markovProbs['Tài'] || 0) * 0.5 + (patternProbs['Tài'] || 0) * 0.5;
+        let totalXiu = (markovProbs['Xỉu'] || 0) * 0.5 + (patternProbs['Xỉu'] || 0) * 0.5;
+
+        const sum = totalTai + totalXiu;
+        totalTai = totalTai / (sum > 0 ? sum : 1);
+        totalXiu = totalXiu / (sum > 0 ? sum : 1);
+
+        let prediction;
+        let winRate;
+        if (totalTai > totalXiu) {
+            prediction = 'Tài';
+            winRate = Math.round(totalTai * 100);
+        } else if (totalXiu > totalTai) {
+            prediction = 'Xỉu';
+            winRate = Math.round(totalXiu * 100);
+        } else {
+            prediction = Math.random() > 0.5 ? 'Tài' : 'Xỉu';
+            winRate = 50;
+        }
+
+        return { prediction, winRate: Math.min(winRate, 99) };
+    }
+
+    formatOutput(latestSessions, prediction) {
+        const lastSession = latestSessions[latestSessions.length - 1];
+        const dices = this.extractDiceValues(lastSession);
+        const total = lastSession.total || (Array.isArray(dices) ? dices.reduce((a, b) => a + b, 0) : 0);
+        const result = this.determineResult(total);
+        const phiendu = lastSession.phanloai || lastSession.phan_loai || lastSession.session || 'Unknown';
+        const nextSession = String(parseInt(phiendu) + 1);
+
+        let output = `                  ↓
+ Phiên: ${phiendu}
+ Xúc xắc: ${dices.join(' , ')}
+ Tổng điểm: ${total}
+ Kết quả: ${result}
+----------------------------- 
+#PHIÊN: ${nextSession}
+Dự Đoán: ${prediction.prediction}
+Tỷ lệ win : ${prediction.winRate}%
+admin : zundar`;
+
+        return output;
+    }
+
+    async analyze() {
+        const data = await this.fetchLatestSession();
+        if (!data) return 'Không thể kết nối API';
+
+        let sessionData;
+        if (Array.isArray(data)) {
+            sessionData = data;
+        } else if (data.data && Array.isArray(data.data)) {
+            sessionData = data.data;
+        } else if (data.sessions && Array.isArray(data.sessions)) {
+            sessionData = data.sessions;
+        } else if (data.results && Array.isArray(data.results)) {
+            sessionData = data.results;
+        } else {
+            sessionData = [data];
+        }
+
+        const processedSessions = sessionData.map(s => {
+            const dices = this.extractDiceValues(s);
+            const total = s.total || (dices.length === 3 ? dices.reduce((a, b) => a + b, 0) : 0);
+            const result = this.determineResult(total);
+            return {
+                ...s,
+                dices: dices,
+                total: total,
+                result: result
+            };
+        }).filter(s => s.result !== 'Unknown');
+
+        if (processedSessions.length === 0) return 'Không có dữ liệu phiên';
+
+        const sortedSessions = processedSessions.sort((a, b) => {
+            const aId = parseInt(a.phanloai || a.phan_loai || a.session || '0');
+            const bId = parseInt(b.phanloai || b.phan_loai || b.session || '0');
+            return aId - bId;
+        });
+
+        sessionHistory = [...sessionHistory.slice(-100), ...sortedSessions];
+        const uniqueHistory = [];
+        const seenIds = new Set();
+        for (const s of sessionHistory) {
+            const id = s.phanloai || s.phan_loai || s.session || '';
+            if (!seenIds.has(id)) {
+                seenIds.add(id);
+                uniqueHistory.push(s);
+            }
+        }
+        sessionHistory = uniqueHistory.slice(-50);
+
+        this.updateMarkovChain(sessionHistory);
+        const prediction = this.predictNextSession(sessionHistory);
+        const output = this.formatOutput(sessionHistory, prediction);
+
+        predictionCache = {
+            timestamp: Date.now(),
+            output: output,
+            prediction: prediction
         };
-    }
 
-    extractFeatures(historyData) {
-        if (historyData.length < 5) return null;
-        const scores = [];
-        const results = [];
-        for (const item of historyData) {
-            if (item.total !== undefined) scores.push(item.total);
-            if (item.result) results.push(item.result);
-        }
-        return { scores, results };
-    }
-
-    analyzePatternStreak(results) {
-        if (results.length < 3) return 0.5;
-        const last10 = results.slice(-10);
-        const taiCount = last10.filter(r => ['Tài', 'tai', 'TÀI'].includes(r)).length;
-        const xiuCount = last10.filter(r => ['Xỉu', 'xiu', 'XỈU'].includes(r)).length;
-        if (taiCount + xiuCount === 0) return 0.5;
-        const taiRatio = taiCount / (taiCount + xiuCount);
-        if (taiRatio >= 0.7) return 0.75;
-        if (taiRatio <= 0.3) return 0.25;
-        return 0.5;
-    }
-
-    analyzeScoreDistribution(scores) {
-        if (scores.length < 5) return 0.5;
-        const recent = scores.slice(-10);
-        const mean = recent.reduce((a, b) => a + b) / recent.length;
-        if (mean > 10.5) return 0.4;
-        if (mean < 9.5) return 0.6;
-        return 0.5;
-    }
-
-    detectCauBet(scores) {
-        if (scores.length < 6) return null;
-        const recent = scores.slice(-6);
-        let alternating = true;
-        for (let i = 0; i < recent.length - 1; i++) {
-            if ((recent[i] > 10 && recent[i + 1] > 10) || (recent[i] <= 10 && recent[i + 1] <= 10)) {
-                alternating = false;
-                break;
-            }
-        }
-        if (alternating) {
-            const last = recent[recent.length - 1];
-            return { prediction: last > 10 ? 'Xỉu' : 'Tài', confidence: 0.75 };
-        }
-        return null;
-    }
-
-    detectCauLap(scores) {
-        if (scores.length < 6) return null;
-        const recent = scores.slice(-5);
-        const allTai = recent.every(s => s > 10);
-        const allXiu = recent.every(s => s <= 10);
-        if (allTai) return { prediction: 'Tài', confidence: 0.70 };
-        if (allXiu) return { prediction: 'Xỉu', confidence: 0.70 };
-        return null;
-    }
-
-    detectCauDao(scores) {
-        if (scores.length < 8) return null;
-        const recent = scores.slice(-8);
-        for (let i = 2; i < recent.length - 4; i++) {
-            const seq1 = recent.slice(i - 2, i + 1);
-            const seq2 = recent.slice(i + 1, i + 4);
-            if (seq2.length >= 3) {
-                const match = seq1.every((val, idx) => (val > 10) === (seq2[idx] > 10));
-                if (match && i + 4 < recent.length) {
-                    return { prediction: recent[i + 4] > 10 ? 'Tài' : 'Xỉu', confidence: 0.68 };
-                }
-            }
-        }
-        return null;
-    }
-
-    detectCauNhay(scores) {
-        if (scores.length < 4) return null;
-        const recent = scores.slice(-4);
-        const jumps = recent.slice(1).map((v, i) => Math.abs(v - recent[i]));
-        const avgJump = jumps.reduce((a, b) => a + b) / jumps.length;
-        if (avgJump > 5) {
-            return { prediction: recent[recent.length - 1] > 10 ? 'Xỉu' : 'Tài', confidence: 0.62 };
-        }
-        return null;
-    }
-
-    markovChainPrediction(results) {
-        if (results.length < 5) return null;
-        const transitions = { 'Tài': { 'Tài': 0, 'Xỉu': 0 }, 'Xỉu': { 'Tài': 0, 'Xỉu': 0 } };
-        for (let i = 0; i < results.length - 1; i++) {
-            const cur = results[i];
-            const next = results[i + 1];
-            if (cur in transitions && next in transitions[cur]) {
-                transitions[cur][next]++;
-            }
-        }
-        const last = results[results.length - 1];
-        if (!(last in transitions)) return null;
-        const trans = transitions[last];
-        const total = trans.Tài + trans.Xỉu;
-        if (total === 0) return null;
-        const taiProb = trans.Tài / total;
-        return taiProb > 0.5 ? { prediction: 'Tài', confidence: Math.min(taiProb, 0.72) } : { prediction: 'Xỉu', confidence: Math.min(1 - taiProb, 0.72) };
-    }
-
-    bayesianUpdate(predictions) {
-        if (predictions.length === 0) return { prediction: 'Tài', confidence: 0.5 };
-        let priorTai = 0.5, priorXiu = 0.5;
-        for (const { prediction, confidence } of predictions) {
-            if (prediction === 'Tài') { priorTai *= confidence; priorXiu *= (1 - confidence); }
-            else { priorXiu *= confidence; priorTai *= (1 - confidence); }
-        }
-        const total = priorTai + priorXiu;
-        if (total === 0) return { prediction: 'Tài', confidence: 0.5 };
-        return priorTai > priorXiu ? { prediction: 'Tài', confidence: priorTai / total } : { prediction: 'Xỉu', confidence: priorXiu / total };
-    }
-
-    finalPrediction(historyData) {
-        const features = this.extractFeatures(historyData);
-        if (!features) return { prediction: 'Tài', winRate: 50 };
-        const { scores, results } = features;
-        const predictions = [];
-        const cauBet = this.detectCauBet(scores); if (cauBet) predictions.push(cauBet);
-        const cauLap = this.detectCauLap(scores); if (cauLap) predictions.push(cauLap);
-        const cauDao = this.detectCauDao(scores); if (cauDao) predictions.push(cauDao);
-        const cauNhay = this.detectCauNhay(scores); if (cauNhay) predictions.push(cauNhay);
-        const markov = this.markovChainPrediction(results); if (markov) predictions.push(markov);
-        if (predictions.length === 0) {
-            const prob = this.analyzeScoreDistribution(scores);
-            predictions.push(prob > 0.5 ? { prediction: 'Xỉu', confidence: prob } : { prediction: 'Tài', confidence: 1 - prob });
-        }
-        const finalResult = this.bayesianUpdate(predictions);
-        let winRate = Math.round(finalResult.confidence * 100);
-        return { prediction: finalResult.prediction, winRate: Math.max(55, Math.min(95, winRate)) };
+        return output;
     }
 }
 
-const analyzer = new AdvancedTXAnalyzer();
+const analyzer = new SunwinAnalyzer();
 
-function parseSessionData(data) {
-    if (Array.isArray(data)) return data;
-    if (data && typeof data === 'object') {
-        if (data.sessions) return data.sessions;
-        if (data.dice) return [{ dice: data.dice, total: data.total, result: data.result, session_id: data.session_id }];
-    }
-    return [];
-}
-
-function formatMessage(oldSession, newSessionId, prediction, winRate) {
-    const diceStr = (oldSession.dice || []).join(', ');
-    const total = oldSession.total || 0;
-    const result = oldSession.result || '';
-    const oldSessionId = oldSession.session_id || '???';
-    return `Phiên: ${oldSessionId}\nXúc xắc: ${diceStr}\nTổng điểm: ${total}\nKết quả: ${result}\n------------------------------\n#PHIÊN: ${newSessionId}\nDự Đoán: ${prediction}\nTỷ lệ win: ${winRate}%\nadmin: zundar🌊`;
-}
-
-async function fetchData() {
+app.get('/', async (req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     try {
-        const response = await axios.get(API_URL, { timeout: 10000 });
-        return response.data;
-    } catch (e) { return null; }
-}
-
-bot.onText(/\/chaybotsun/, async (msg) => {
-    if (msg.chat.id !== ADMIN_ID) return bot.sendMessage(msg.chat.id, 'Mày không có quyền.');
-    if (isRunning) return bot.sendMessage(msg.chat.id, 'Bot đang chạy rồi.');
-    isRunning = true;
-    chatIds.add(msg.chat.id);
-    lastSessionId = null;
-    await bot.sendMessage(msg.chat.id, 'Bot bắt đầu phân tích Tài Xỉu.');
-});
-
-bot.onText(/\/stop/, async (msg) => {
-    if (msg.chat.id !== ADMIN_ID) return bot.sendMessage(msg.chat.id, 'Mày không có quyền.');
-    isRunning = false;
-    chatIds.delete(msg.chat.id);
-    await bot.sendMessage(msg.chat.id, 'Bot đã dừng.');
-});
-
-setInterval(async () => {
-    if (!isRunning || chatIds.size === 0) return;
-    const data = await fetchData();
-    if (!data) return;
-    const sessions = parseSessionData(data);
-    if (sessions.length < 2) return;
-    const oldSession = sessions[sessions.length - 2];
-    const latestSession = sessions[sessions.length - 1];
-    const latestSessionId = latestSession.session_id || '';
-    if (latestSessionId === lastSessionId) return;
-    lastSessionId = latestSessionId;
-    const newSessionId = parseInt(oldSession.session_id || 0) + 1;
-    const allSessionsExceptLatest = sessions.slice(0, -1);
-    const { prediction, winRate } = analyzer.finalPrediction(allSessionsExceptLatest);
-    const message = formatMessage(oldSession, newSessionId, prediction, winRate);
-    for (const cid of chatIds) {
-        try { await bot.sendMessage(cid, message); } catch (e) {}
+        const result = await analyzer.analyze();
+        res.send(result);
+    } catch (error) {
+        res.send('Lỗi phân tích, thử lại sau');
     }
-}, 3000);
+});
 
-console.log('SunWin Bot started...');
+app.get('/api', async (req, res) => {
+    try {
+        const result = await analyzer.analyze();
+        res.json({ success: true, data: result, timestamp: Date.now() });
+    } catch (error) {
+        res.json({ success: false, error: 'Lỗi phân tích' });
+    }
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+const server = app.listen(PORT, () => {
+    console.log(`Sunwin Analyzer running on port ${PORT}`);
+});
+
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
+
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err.message);
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Rejection:', reason);
+});
